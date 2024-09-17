@@ -12,8 +12,13 @@ import os
 import math
 import gc
 import time
-high=128
-low = int(high/4)
+import seaborn as sns
+from sklearn import metrics
+from torchsummary import summary
+
+high = 128
+low = 32
+
 # Custom Dataset
 class NWPU_RESISC45(Dataset):
     def __init__(self, root_dir, classes, transform=None):
@@ -41,6 +46,39 @@ class NWPU_RESISC45(Dataset):
             image = self.transform(image)
 
         return image, label
+def print_ridgelet_parameters(model):
+    # Access ridgelet parameters
+    if hasattr(model, 'high_res_ridgelet'):
+        ridgelet = model.high_res_ridgelet
+        print("Ridgelet Parameters:")
+        print("Scales:", ridgelet.scales.data.cpu().numpy())
+        print("Directions:", ridgelet.directions.data.cpu().numpy())
+        print("Positions:", ridgelet.positions.data.cpu().numpy())
+    else:
+        print("No RidgeletLayer found in the model.")
+def print_gradients(model):
+    if hasattr(model, 'high_res_ridgelet'):
+        ridgelet = model.high_res_ridgelet
+        print("Gradients of Scales:", ridgelet.scales.grad)
+        print("Gradients of Directions:", ridgelet.directions.grad)
+        print("Gradients of Positions:", ridgelet.positions.grad)
+# Example to print parameters before and after training
+def print_parameters_before_after_training(model):
+    if hasattr(model, 'high_res_ridgelet'):
+        ridgelet = model.high_res_ridgelet
+        print("Before training:")
+        print("Scales:", ridgelet.scales.data.cpu().numpy())
+        print("Directions:", ridgelet.directions.data.cpu().numpy())
+        print("Positions:", ridgelet.positions.data.cpu().numpy())
+
+        # Train model here...
+
+        print("After training:")
+        print("Scales:", ridgelet.scales.data.cpu().numpy())
+        print("Directions:", ridgelet.directions.data.cpu().numpy())
+        print("Positions:", ridgelet.positions.data.cpu().numpy())
+    else:
+        print("No RidgeletLayer found in the model.")
 
 # Ridgelet Layer
 class RidgeletLayer(nn.Module):
@@ -77,7 +115,10 @@ class RidgeletLayer(nn.Module):
                 ridgelet_kernel = self.ridgelet_function(x1, x2, direction, scale, position)
                 kernel[out_ch, :, :, :] += ridgelet_kernel
 
+        
+
         return kernel
+
 
     def forward(self, x):
         device = x.device
@@ -86,8 +127,10 @@ class RidgeletLayer(nn.Module):
         return x
 
 # Mixed Resolution CNN
+# Mixed Resolution CNN with Pooling and Softmax Layer
+# Mixed Resolution CNN
 class MixedResolutionCNN(nn.Module):
-    def __init__(self, num_classes=5, num_kernels=1):
+    def __init__(self, num_classes=10, num_kernels=1):
         super(MixedResolutionCNN, self).__init__()
         self.num_classes = num_classes
 
@@ -96,7 +139,7 @@ class MixedResolutionCNN(nn.Module):
         self.low_res_pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
         # High-resolution processing
-        self.high_res_ridgelet = RidgeletLayer(in_channels=3, out_channels=16, kernel_size=50, num_kernels=10)
+        self.high_res_ridgelet = RidgeletLayer(in_channels=3, out_channels=16, kernel_size=30, num_kernels=8)
         self.high_res_pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
         # Calculate the output size after processing
@@ -107,9 +150,9 @@ class MixedResolutionCNN(nn.Module):
         self.fc3 = nn.Linear(256, self.num_classes)
     
     def _get_conv_output_size(self):
-        device = next(self.parameters()).device
-        dummy_low_res = torch.zeros(1, 3, low, low, device=device)  # Adjusted to 16x16 for low resolution
-        dummy_high_res = torch.zeros(1, 3, high, high, device=device)
+        # Dummy inputs to compute the output shape
+        dummy_low_res = torch.zeros(1, 3, low, low)  # Low-resolution dummy input
+        dummy_high_res = torch.zeros(1, 3, high, high)  # High-resolution dummy input
 
         # Low-resolution feature extraction
         x_low = F.relu(self.low_res_conv(dummy_low_res))
@@ -121,30 +164,41 @@ class MixedResolutionCNN(nn.Module):
         x_high = self.high_res_pool(x_high)
         x_high = x_high.view(x_high.size(0), -1)
 
+        # Return the total number of features after concatenating both
         return x_low.size(1) + x_high.size(1)
 
     def forward(self, x):
+        # Low-resolution branch
         x_low = F.interpolate(x, size=(low, low), mode='bilinear', align_corners=False)
         x_low = F.relu(self.low_res_conv(x_low))
         x_low = self.low_res_pool(x_low)
-        x_low = x_low.view(x_low.size(0), -1)
+        x_low = x_low.view(x_low.size(0), -1)  # Flatten the tensor
 
+        # High-resolution branch
         x_high = F.relu(self.high_res_ridgelet(x))
         x_high = self.high_res_pool(x_high)
-        x_high = x_high.view(x_high.size(0), -1)
+        x_high = x_high.view(x_high.size(0), -1)  # Flatten the tensor
 
+        # Concatenate both branches
         x_fused = torch.cat((x_low, x_high), dim=1)
 
+        # Fully connected layers
         x_fused = F.relu(self.dropout(self.fc1(x_fused)))
         x_fused = F.relu(self.fc2(x_fused))
         x_fused = self.fc3(x_fused)
 
         return x_fused
 
+
+def print_model_params(model):
+    print("Model parameters:")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(f"Name: {name}, Shape: {param.shape}")
 # Function for model training
-def train_model(trainloader, device, epochs=25, accumulation_steps=4, num_kernels=10):
-    model = MixedResolutionCNN(num_classes=5, num_kernels=num_kernels).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+def train_model(trainloader, device, epochs=25, accumulation_steps=4):
+    model = MixedResolutionCNN(num_classes=10).to(device)
+    optimizer = optim.SGD(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
     model.train()
@@ -153,6 +207,7 @@ def train_model(trainloader, device, epochs=25, accumulation_steps=4, num_kernel
     train_losses = []
     train_accuracies = []
     start_time = time.time()
+    
     for epoch in range(epochs):
         print(f"\nEpoch {epoch+1}/{epochs}")
         epoch_start_time = time.time()  # Start time for the epoch
@@ -192,12 +247,37 @@ def train_model(trainloader, device, epochs=25, accumulation_steps=4, num_kernel
         # Measure and print the epoch duration
         epoch_duration = time.time() - epoch_start_time
         print(f"Epoch [{epoch+1}/{epochs}] - Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}, Duration: {epoch_duration:.2f} seconds")
+        
 
     # Measure and print the total training time
     total_training_time = time.time() - start_time
     print(f"Total training time: {total_training_time:.2f} seconds")
 
-    return train_losses, train_accuracies
+    return model, train_losses, train_accuracies
+
+
+# Function to plot confusion matrix
+def plot_confusion_matrix(model, dataloader, classes, device):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    cf_matrix = metrics.confusion_matrix(all_labels, all_preds)
+
+    plt.figure(figsize=(10, 7))
+    ax = sns.heatmap(cf_matrix, annot=True, cmap='Blues', fmt='g', xticklabels=classes, yticklabels=classes)
+    ax.set_title('Confusion Matrix')
+    ax.set_xlabel('Predicted Labels')
+    ax.set_ylabel('True Labels')
+    plt.show()
 
 def main():
     # Device setup
@@ -214,8 +294,8 @@ def main():
     root_dir = r"C:\Users\MaxSc\Desktop\dataset\NWPU-RESISC45"  # Update this path to where the dataset is located
     
     # Define the classes to use
-    classes = ['airplane', 'railway', 'ship', 'palace', 'bridge']  # Example classes
-
+    #classes = ['airplane', 'railway', 'ship', 'palace', 'bridge']  # Example classes
+    classes = ['airplane', 'railway', 'ship', 'palace', 'bridge', 'island', 'freeway', 'river', 'stadium', 'church']
     # Load the dataset
     dataset = NWPU_RESISC45(root_dir=root_dir, classes=classes, transform=transform)
     
@@ -223,9 +303,9 @@ def main():
     trainloader = DataLoader(dataset, batch_size=64, shuffle=True, num_workers=4)
     
     # Training the model
-    num_kernels = 4  # Adjust the number of kernels here
-    train_losses, train_accuracies = train_model(trainloader, device, epochs=50, accumulation_steps=4, num_kernels=num_kernels)
-    
+    num_kernels = 8  # Adjust the number of kernels here
+    model, train_losses, train_accuracies = train_model(trainloader, device, epochs=20, accumulation_steps=4)
+    #summary(model, input_size=(3, high, high), device=str(device))
     # Plot training results
     plt.figure()
     plt.plot(train_accuracies, label='Train Accuracy', color='b')
@@ -235,6 +315,9 @@ def main():
     plt.legend()
     plt.grid(True)
     plt.show()
+
+    # Plot confusion matrix after training
+    plot_confusion_matrix(model, trainloader, classes, device)
 
 if __name__ == "__main__":
     main()
